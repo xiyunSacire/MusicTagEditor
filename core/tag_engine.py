@@ -1,12 +1,14 @@
 import os
 import io
+import sys
+import stat
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 from PIL import Image
 
 import mutagen
-from mutagen.flac import FLAC, Picture
-from mutagen.mp3 import MP3
+from mutagen.flac import FLAC, Picture, FLACNoHeaderError
+from mutagen.mp3 import MP3, HeaderNotFoundError
 from mutagen.id3 import (
     ID3,
     TIT2,
@@ -81,12 +83,223 @@ class BaseAudioHandler(ABC):
         """删除封面"""
         pass
 
+    def _save_audio(self):
+        """安全保存音频文件，自动处理只读属性，并在被锁定时精准定位占用进程"""
+        # 1. 尝试自动解除文件的只读属性
+        try:
+            import stat
+            if os.path.exists(self.file_path):
+                mode = os.stat(self.file_path).st_mode
+                if not (mode & stat.S_IWRITE):
+                    os.chmod(self.file_path, stat.S_IWRITE)
+        except Exception:
+            pass
+
+        try:
+            self.audio.save()
+        except Exception as e:
+            # 判断是否为权限不足 / 文件被占用锁定的错误（全面兼容 mutagen 包装后的各类异常）
+            is_perm = False
+            if isinstance(e, (PermissionError, OSError)) and getattr(e, "errno", None) == 13:
+                is_perm = True
+            elif "Permission denied" in str(e) or "Errno 13" in str(e):
+                is_perm = True
+
+            if is_perm:
+                # 再次尝试通过 chmod 修复只读并重试一次保存
+                try:
+                    import stat
+                    os.chmod(self.file_path, stat.S_IWRITE)
+                    self.audio.save()
+                    return
+                except Exception:
+                    pass
+
+                # 精准诊断：是否被外部进程（音乐播放器、系统预览等）独占占用
+                locking_procs = get_processes_locking_file(self.file_path)
+                if locking_procs:
+                    proc_str = "、".join(locking_procs)
+                    raise PermissionError(
+                        f"无法保存文件，该音频正被其他软件占用锁定！\n\n"
+                        f"【正在占用的程序】: {proc_str}\n"
+                        f"【文件路径】: {self.file_path}\n\n"
+                        f"【解决方法】请在【{proc_str}】中暂停播放或关闭该文件，然后再进行清洗或保存。"
+                    ) from e
+                else:
+                    raise PermissionError(
+                        f"无法保存文件，操作被系统拒绝（文件被占用或无写入权限）。\n\n"
+                        f"【文件路径】: {self.file_path}\n\n"
+                        f"【排查建议】\n"
+                        f"1. 请检查该音乐是否正在其他播放器（如网易云、QQ音乐、Foobar2000、PotPlayer等）中播放，若正在播放请先暂停；\n"
+                        f"2. 请检查该文件所在目录的修改权限；\n"
+                        f"3. 右键该文件查看“属性”，确认未勾选“只读”。"
+                    ) from e
+            raise
+
+
+def get_processes_locking_file(filepath: str) -> List[str]:
+    """使用 Windows 原生 Restart Manager API 探测锁定指定文件的进程名称"""
+    if sys.platform != "win32" or not os.path.exists(filepath):
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD),
+            ]
+
+        class RM_UNIQUE_PROCESS(ctypes.Structure):
+            _fields_ = [
+                ("dwProcessId", wintypes.DWORD),
+                ("ProcessStartTime", FILETIME),
+            ]
+
+        class RM_PROCESS_INFO(ctypes.Structure):
+            _fields_ = [
+                ("Process", RM_UNIQUE_PROCESS),
+                ("strAppName", wintypes.WCHAR * 256),
+                ("strServiceShortName", wintypes.WCHAR * 64),
+                ("ApplicationType", wintypes.DWORD),
+                ("AppStatus", wintypes.DWORD),
+                ("TSSessionId", wintypes.DWORD),
+                ("bRestartable", wintypes.BOOL),
+            ]
+
+        rstrtmgr = ctypes.windll.rstrtmgr
+        session = wintypes.DWORD()
+        key = (wintypes.WCHAR * 65)()
+        res = rstrtmgr.RmStartSession(ctypes.byref(session), 0, key)
+        if res != 0:
+            return []
+        try:
+            abs_path = os.path.abspath(filepath)
+            path_arr = (wintypes.LPCWSTR * 1)(abs_path)
+            res = rstrtmgr.RmRegisterResources(session, 1, path_arr, 0, None, 0, None)
+            if res != 0:
+                return []
+            n_proc_info_needed = wintypes.UINT(0)
+            n_proc_info = wintypes.UINT(0)
+            res = rstrtmgr.RmGetList(
+                session,
+                ctypes.byref(n_proc_info_needed),
+                ctypes.byref(n_proc_info),
+                None,
+                ctypes.byref(wintypes.DWORD()),
+            )
+            if res == 234:  # ERROR_MORE_DATA
+                n_proc_info = n_proc_info_needed
+                proc_info_arr = (RM_PROCESS_INFO * n_proc_info.value)()
+                res = rstrtmgr.RmGetList(
+                    session,
+                    ctypes.byref(n_proc_info_needed),
+                    ctypes.byref(n_proc_info),
+                    proc_info_arr,
+                    ctypes.byref(wintypes.DWORD()),
+                )
+                if res == 0:
+                    names = []
+                    for p in proc_info_arr:
+                        app_name = p.strAppName.strip()
+                        if app_name:
+                            names.append(app_name)
+                    return list(dict.fromkeys(names))
+        finally:
+            rstrtmgr.RmEndSession(session)
+    except Exception:
+        pass
+    return []
+
+
+def detect_audio_format(file_path: str) -> str:
+    """根据文件二进制头部特征探测其实际文件格式或特征"""
+    if not os.path.exists(file_path):
+        return "文件不存在"
+    try:
+        size = os.path.getsize(file_path)
+        if size == 0:
+            return "空文件 (0 字节)"
+        with open(file_path, "rb") as f:
+            header = f.read(64)
+    except Exception as e:
+        return f"无法读取文件 ({e})"
+
+    if len(header) < 4:
+        return "数据过短 (无效文件)"
+
+    # 1. 常见加密音乐格式
+    if header.startswith(b"CTENFDAM"):
+        return "网易云加密音乐 (NCM 格式)"
+    if len(header) >= 4 and header[:4] in (b"\x7c\xd5\x19\xbb", b"\x7b\xd5\x19\xbb"):
+        return "酷狗加密音乐 (KGM/VPR 格式)"
+    if header.startswith(b"yeelion") or header.startswith(b"kwm"):
+        return "酷我加密音乐 (KWM 格式)"
+    if header.startswith(b"qmc") or header.startswith(b"QMC"):
+        return "QQ音乐加密格式 (QMC 格式)"
+
+    # 2. 常见无损/有损格式
+    if header.startswith(b"fLaC"):
+        return "FLAC 无损音频"
+    if len(header) >= 8 and header[4:8] == b"ftyp":
+        brand = header[8:12].decode("latin1", errors="ignore").strip()
+        brand_desc = f", brand: {brand}" if brand else ""
+        return f"M4A / MP4 容器 (AAC/ALAC 音频{brand_desc})"
+    if header.startswith(b"ID3"):
+        return "带 ID3v2 标签的音频 (通常为 MP3)"
+    if header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
+        return "MP3 音频 (MPEG Frame)"
+    if header.startswith(b"OggS"):
+        return "OGG / Opus / Vorbis 音频"
+    if header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WAVE":
+        return "WAV 无损音频"
+    if header.startswith(b"MAC "):
+        return "APE 无损音频"
+    if header.startswith(b"\x1a\x45\xdf\xa3"):
+        return "WebM / MKV 音频容器"
+    if header.startswith(b"DSD ") or header.startswith(b"FRM8"):
+        return "DSD / DSF 音频"
+
+    return "未知或非标准音频格式"
+
 
 class FlacHandler(BaseAudioHandler):
     """FLAC 文件处理器"""
 
     def _load(self):
-        self.audio = FLAC(self.file_path)
+        try:
+            self.audio = FLAC(self.file_path)
+        except FLACNoHeaderError as e:
+            detected = detect_audio_format(self.file_path)
+            if "M4A" in detected or "MP4" in detected:
+                raise ValueError(
+                    f"文件虽然使用了 .flac 后缀，但实际是【{detected}】。\n"
+                    f"【原因】该文件可能是从网页/视频网站导出的 AAC/M4A 音频被直接重命名为了 .flac。\n"
+                    f"【建议】请将其后缀名改回 .m4a，或使用转码工具转换为标准 FLAC 无损音频。"
+                ) from e
+            elif "加密" in detected:
+                raise ValueError(
+                    f"文件并非标准 FLAC，检测到特征为【{detected}】。\n"
+                    f"【原因】这是受版权保护的加密音乐文件，无法直接编辑元数据。\n"
+                    f"【建议】请先使用相应的解密工具转换为普通音频格式后再导入。"
+                ) from e
+            elif "MP3" in detected:
+                raise ValueError(
+                    f"文件虽然使用了 .flac 后缀，但实际是【{detected}】。\n"
+                    f"【建议】请将其文件后缀名修改为 .mp3 后重试。"
+                ) from e
+            elif "空文件" in detected or "数据过短" in detected:
+                raise ValueError(f"文件无效: {detected}") from e
+            else:
+                raise ValueError(
+                    f"不是有效的 FLAC 音频文件（未检测到标准 fLaC 头部，识别特征: {detected}）。\n"
+                    f"文件可能已损坏，或由其他不支持的格式修改后缀名而来。"
+                ) from e
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise
+            raise ValueError(f"读取 FLAC 文件失败: {str(e)}") from e
 
     def get_stream_info(self) -> AudioStreamInfo:
         info = self.audio.info
@@ -174,7 +387,7 @@ class FlacHandler(BaseAudioHandler):
         update_tag("lyrics", tags.lyrics, ["unsyncedlyrics"])
         update_tag("comment", tags.comment)
 
-        self.audio.save()
+        self._save_audio()
 
     def clean_anomalies(self, keys: Optional[List[str]] = None):
         if not self.audio.tags:
@@ -191,7 +404,7 @@ class FlacHandler(BaseAudioHandler):
             if k in self.audio.tags:
                 del self.audio.tags[k]
 
-        self.audio.save()
+        self._save_audio()
 
     def get_cover(self) -> Optional[CoverData]:
         if not self.audio.pictures:
@@ -242,18 +455,46 @@ class FlacHandler(BaseAudioHandler):
         # 清除旧的封面，写入新封面
         self.audio.clear_pictures()
         self.audio.add_picture(pic)
-        self.audio.save()
+        self._save_audio()
 
     def remove_cover(self):
         self.audio.clear_pictures()
-        self.audio.save()
+        self._save_audio()
 
 
 class Mp3Handler(BaseAudioHandler):
     """MP3 文件处理器"""
 
     def _load(self):
-        self.audio = MP3(self.file_path)
+        try:
+            self.audio = MP3(self.file_path)
+        except (HeaderNotFoundError, mutagen.mp3.error, Exception) as e:
+            detected = detect_audio_format(self.file_path)
+            if "FLAC" in detected:
+                raise ValueError(
+                    f"文件虽然使用了 .mp3 后缀，但实际是【{detected}】。\n"
+                    f"【建议】请将文件后缀名更改为 .flac 后重新导入。"
+                ) from e
+            elif "M4A" in detected or "MP4" in detected:
+                raise ValueError(
+                    f"文件虽然使用了 .mp3 后缀，但实际是【{detected}】。\n"
+                    f"【原因】该文件可能是 AAC/M4A 音频被直接重命名为了 .mp3。\n"
+                    f"【建议】请将其后缀名改回 .m4a，或使用转码工具转换为标准 MP3 音频。"
+                ) from e
+            elif "加密" in detected:
+                raise ValueError(
+                    f"文件并非标准 MP3，检测到特征为【{detected}】。\n"
+                    f"【原因】这是受版权保护的加密音乐文件，无法直接编辑元数据。\n"
+                    f"【建议】请先使用解密工具解密后再导入。"
+                ) from e
+            elif "空文件" in detected or "数据过短" in detected:
+                raise ValueError(f"文件无效: {detected}") from e
+            else:
+                raise ValueError(
+                    f"不是有效的 MP3 音频文件（未找到有效的 MPEG 帧头，识别特征: {detected}，原错误: {str(e)}）。\n"
+                    f"文件可能已损坏，或由其他不支持的格式修改后缀名而来。"
+                ) from e
+
         if self.audio.tags is None:
             try:
                 self.audio.add_tags()
@@ -405,7 +646,7 @@ class Mp3Handler(BaseAudioHandler):
         if comm_val:
             self.audio.tags.add(COMM(encoding=3, lang="eng", desc="", text=[comm_val]))
 
-        self.audio.save()
+        self._save_audio()
 
     def clean_anomalies(self, keys: Optional[List[str]] = None):
         if not self.audio.tags:
@@ -421,7 +662,7 @@ class Mp3Handler(BaseAudioHandler):
             if k in self.audio.tags:
                 del self.audio.tags[k]
 
-        self.audio.save()
+        self._save_audio()
 
     def get_cover(self) -> Optional[CoverData]:
         if not self.audio.tags:
@@ -477,7 +718,7 @@ class Mp3Handler(BaseAudioHandler):
             data=image_bytes,
         )
         self.audio.tags.add(apic)
-        self.audio.save()
+        self._save_audio()
 
     def remove_cover(self):
         if not self.audio.tags:
@@ -485,7 +726,7 @@ class Mp3Handler(BaseAudioHandler):
         for k in list(self.audio.tags.keys()):
             if k.startswith("APIC"):
                 del self.audio.tags[k]
-        self.audio.save()
+        self._save_audio()
 
 
 def load_audio(file_path: str) -> BaseAudioHandler:
@@ -496,4 +737,8 @@ def load_audio(file_path: str) -> BaseAudioHandler:
     elif ext == ".mp3":
         return Mp3Handler(file_path)
     else:
-        raise ValueError(f"暂不支持的音频格式: {ext} (目前仅支持 .flac 与 .mp3)")
+        detected = detect_audio_format(file_path)
+        raise ValueError(
+            f"暂不支持的音频后缀: {ext} (实际格式特征: {detected})。\n"
+            f"【提示】目前小工具仅支持标准 .flac 与 .mp3 音频文件。"
+        )

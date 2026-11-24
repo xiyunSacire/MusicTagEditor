@@ -27,13 +27,16 @@ try {
     Write-Host ">>> [1/5] 清理旧编译产物与缓存..." -ForegroundColor Cyan
     Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 
-    Write-Host ">>> [2/5] 检查多分辨率图标..." -ForegroundColor Cyan
+    Write-Host ">>> [2/5] 检查多分辨率图标与打包规范..." -ForegroundColor Cyan
     if (-not (Test-Path "app.ico")) {
         throw "缺少 app.ico 图标文件！"
     }
+    if (-not (Test-Path "MusicTagEditor.spec")) {
+        throw "缺少 MusicTagEditor.spec 规范文件！"
+    }
 
     Write-Host ">>> [3/5] 执行 PyInstaller 工业级单目录打包..." -ForegroundColor Cyan
-    & $PyInstallerPath -D -w -i app.ico --add-data "app.ico;." -n "MusicTagEditor" main.py
+    & $PyInstallerPath MusicTagEditor.spec
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller 打包失败，退出代码: $LASTEXITCODE"
     }
@@ -42,6 +45,9 @@ try {
     Copy-Item "app.ico" "dist\MusicTagEditor\app.ico" -Force
     if (Test-Path "MusicTagEditor.cer") {
         Copy-Item "MusicTagEditor.cer" "dist\MusicTagEditor\MusicTagEditor.cer" -Force
+    }
+    if (Test-Path "install_cert.bat") {
+        Copy-Item "install_cert.bat" "dist\MusicTagEditor\install_cert.bat" -Force
     }
 
     # 1. 补齐 _ctypes 所需的 ffi.dll 及基础压缩模块所需 C-DLL
@@ -53,21 +59,34 @@ try {
         }
     }
 
-    # 2. 补齐 Conda Python 3.12 专属配套的完整 Visual C++ 运行时套件（杜绝版本符号不匹配）
-    $CondaVCDlls = @(
+    # 2. 补齐与 PySide6 严格同源的完整 Visual C++ 运行时套件到 _internal 根目录（杜绝 Error 127 导出符号不匹配）
+    $PySide6Dir = "$CondaRoot\Lib\site-packages\PySide6"
+    $PySide6VCDlls = @(
         "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
-        "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll",
-        "vcruntime140.dll", "vcruntime140_1.dll"
+        "msvcp140_codecvt_ids.dll", "vcruntime140.dll", "vcruntime140_1.dll"
     )
-    foreach ($dll in $CondaVCDlls) {
-        $dllPath = Join-Path $CondaRoot $dll
-        if (Test-Path $dllPath) {
-            Copy-Item $dllPath "dist\MusicTagEditor\_internal\" -Force
+    foreach ($dll in $PySide6VCDlls) {
+        $srcPath = Join-Path $PySide6Dir $dll
+        if (Test-Path $srcPath) {
+            Copy-Item $srcPath "dist\MusicTagEditor\_internal\$dll" -Force
         }
     }
 
-    # 3. 解除 Windows 对构建产物可能附加的 Zone.Identifier 锁定
+    # 3. 将 shiboken6.abi3.dll 提取到 _internal 及 PySide6 目录，保证动态链接直接可达
+    $ShibokenDll = "$CondaRoot\Lib\site-packages\shiboken6\shiboken6.abi3.dll"
+    if (Test-Path $ShibokenDll) {
+        Copy-Item $ShibokenDll "dist\MusicTagEditor\_internal\shiboken6.abi3.dll" -Force
+        Copy-Item $ShibokenDll "dist\MusicTagEditor\_internal\PySide6\shiboken6.abi3.dll" -Force
+    }
+
+    # 4. 二次兜底清理：移除任何误打包的冲突 DLL (icu*.dll, ucrtbase.dll, api-ms-win*.dll)
+    Remove-Item "dist\MusicTagEditor\_internal\icu*.dll" -Force -ErrorAction SilentlyContinue
+    Remove-Item "dist\MusicTagEditor\_internal\ucrtbase.dll" -Force -ErrorAction SilentlyContinue
+    Remove-Item "dist\MusicTagEditor\_internal\api-ms-win*.dll" -Force -ErrorAction SilentlyContinue
+
+    # 5. 解除 Windows 对构建产物可能附加的 Zone.Identifier 锁定
     Get-ChildItem "dist\MusicTagEditor" -Recurse | Unblock-File -ErrorAction SilentlyContinue
+    Unblock-File "dist\MusicTagEditor\MusicTagEditor.exe" -ErrorAction SilentlyContinue
 
     Write-Host ">>> [5/5] 执行 Authenticode 自签名..." -ForegroundColor Cyan
     $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.Subject -like "*MusicTagEditor*" } | Select-Object -First 1
@@ -77,6 +96,9 @@ try {
     } else {
         Write-Warning "未找到代码签名证书，可先运行 install_cert.bat 生成证书。"
     }
+
+    # 签名完成后二次确保所有文件解除安全锁定
+    Get-ChildItem "dist\MusicTagEditor" -Recurse | Unblock-File -ErrorAction SilentlyContinue
 
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Green
@@ -89,13 +111,8 @@ try {
 catch {
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Red
-    Write-Host " [错误] 打包过程发生异常：" -ForegroundColor Red
-    Write-Host $_ -ForegroundColor Red
+    Write-Host " [失败] 构建过程发生异常: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "============================================================" -ForegroundColor Red
     Write-Host ""
-}
-
-if ([Environment]::UserInteractive) {
-    Write-Host "构建流程已结束。" -ForegroundColor Gray
-    Read-Host "按回车键 (Enter) 退出..."
+    exit 1
 }

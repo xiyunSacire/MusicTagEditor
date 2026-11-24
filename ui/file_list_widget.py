@@ -129,11 +129,14 @@ class FileListWidget(QWidget):
     def add_paths(self, paths: List[str]):
         """收集路径中的音频文件并加入列表"""
         collected = []
+        unsupported = []
         for p in paths:
             if os.path.isfile(p):
                 ext = os.path.splitext(p)[1].lower()
                 if ext in self.SUPPORTED_EXTS:
                     collected.append(os.path.abspath(p))
+                else:
+                    unsupported.append((os.path.basename(p), ext))
             elif os.path.isdir(p):
                 for root, _, files in os.walk(p):
                     for f in files:
@@ -142,6 +145,7 @@ class FileListWidget(QWidget):
                             collected.append(os.path.abspath(os.path.join(root, f)))
 
         new_added = []
+        failed_files = []
         for p in collected:
             if p not in self.file_data_map:
                 try:
@@ -155,7 +159,12 @@ class FileListWidget(QWidget):
                     self.ordered_paths.append(p)
                     new_added.append(p)
                 except Exception as e:
-                    print(f"载入音频失败 {p}: {e}")
+                    print(f"载入音频失败 {p}:\n{e}")
+                    failed_files.append((os.path.basename(p), str(e)))
+
+        if unsupported:
+            for name, ext in unsupported:
+                failed_files.append((name, f"不支持的文件扩展名: {ext}（目前仅支持 .flac 与 .mp3）"))
 
         if new_added:
             self._refresh_table()
@@ -163,6 +172,20 @@ class FileListWidget(QWidget):
             # 默认选中第一个
             if self.table.rowCount() > 0 and not self.table.selectedItems():
                 self.table.selectRow(0)
+
+        if failed_files:
+            if len(failed_files) <= 3:
+                details = "\n\n".join([f"• 【{name}】\n{reason}" for name, reason in failed_files])
+            else:
+                shown = failed_files[:3]
+                details = "\n\n".join([f"• 【{name}】\n{reason}" for name, reason in shown])
+                details += f"\n\n... 等共计 {len(failed_files)} 个文件载入失败。"
+
+            QMessageBox.warning(
+                self,
+                "音频载入异常提示",
+                f"有 {len(failed_files)} 个文件未能载入：\n\n{details}",
+            )
 
     def update_file_status(self, file_path: str, anomaly_count: int):
         """刷新单个文件的异常状态与表格行"""

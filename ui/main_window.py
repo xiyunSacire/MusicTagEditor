@@ -209,6 +209,7 @@ class MainWindow(QMainWindow):
         """批量清理列表中所有异常文件"""
         success_count = 0
         error_count = 0
+        failed_details = []
 
         for p in dirty_paths:
             try:
@@ -218,7 +219,7 @@ class MainWindow(QMainWindow):
                 self.file_list_widget.update_file_status(p, len(anomalies))
                 success_count += 1
             except Exception as e:
-                print(f"批量清理失败 {p}: {e}")
+                failed_details.append(f"• {os.path.basename(p)}: {str(e)}")
                 error_count += 1
 
         # 如果当前打开的文件也在清理列表中，重新刷新
@@ -228,6 +229,10 @@ class MainWindow(QMainWindow):
         msg = f"批量清理完成！\n成功清理: {success_count} 个文件"
         if error_count > 0:
             msg += f"\n失败: {error_count} 个文件"
+            if len(failed_details) <= 3:
+                msg += "\n\n失败原因:\n" + "\n".join(failed_details)
+            else:
+                msg += "\n\n部分失败原因:\n" + "\n".join(failed_details[:3]) + f"\n... 以及其他 {len(failed_details)-3} 个文件"
 
         self.status_bar.showMessage(f"✔ 批量清洗完成，处理了 {success_count} 个文件", 5000)
         QMessageBox.information(self, "批量清理结果", msg)

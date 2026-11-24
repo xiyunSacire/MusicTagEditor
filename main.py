@@ -2,14 +2,53 @@ import os
 import sys
 import ctypes
 
+# 关键：在导入任何 PySide6 模块前，显式将运行时所有相关目录加入 Windows DLL 搜索树 (适配 Python 3.8+)
+if sys.platform == "win32":
+    search_dirs = []
+    if hasattr(sys, "_MEIPASS"):
+        search_dirs.append(sys._MEIPASS)
+        search_dirs.append(os.path.join(sys._MEIPASS, "PySide6"))
+        search_dirs.append(os.path.join(sys._MEIPASS, "shiboken6"))
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        search_dirs.append(exe_dir)
+        search_dirs.append(os.path.join(exe_dir, "_internal"))
+        search_dirs.append(os.path.join(exe_dir, "_internal", "PySide6"))
+        search_dirs.append(os.path.join(exe_dir, "_internal", "shiboken6"))
+    
+    for d in search_dirs:
+        if os.path.isdir(d):
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(d)
+                except Exception:
+                    pass
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
 # 将项目根目录加入模块搜索路径
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QIcon
+try:
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QFont, QIcon
+except Exception as e:
+    import traceback
+    try:
+        log_path = os.path.join(os.path.dirname(sys.executable), "crash_debug.txt")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("=== System Information ===\n")
+            f.write(f"sys.executable: {sys.executable}\n")
+            f.write(f"sys._MEIPASS: {getattr(sys, '_MEIPASS', None)}\n")
+            f.write(f"sys.path: {sys.path}\n")
+            f.write(f"os.environ['PATH']: {os.environ.get('PATH')}\n")
+            f.write("\n=== Traceback ===\n")
+            f.write(traceback.format_exc())
+    except Exception:
+        pass
+    raise
 
 from ui.main_window import MainWindow
 from ui.style import MODERN_STYLE

@@ -19,6 +19,7 @@ venv.bak/
 build/
 dist/
 *.spec
+!MusicTagEditor.spec
 *.manifest
 
 # ============================================================
